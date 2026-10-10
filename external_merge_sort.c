@@ -132,4 +132,16 @@ void merge_k_runs(char input_runs[][256], int k, const char *output_path, IOStat
             heap.arr[0].value = atoi(line);
             heap.arr[0].file_index = f_idx;
         } else {
-            heap
+            heap.arr[0] = heap.arr[heap.size - 1];
+            heap.size--;
+        }
+        heapify(&heap, 0);
+    }
+
+    fclose(out_f);
+    for (int i = 0; i < k; i++) {
+        if (open_files[i]) fclose(open_files[i]);
+    }
+    free(open_files);
+    free(heap.arr);
+}
