@@ -36,16 +36,16 @@ Caution: Window/MSVC may encounter small errors (unaffected to the final result)
 
 ## Build
 
-After adding `stress_test_week4_fixed.c` to the repository, compile it with GCC:
+After adding `stress_test_week4.c` to the repository, compile it with GCC:
 
 ```bash
-gcc -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -O2 stress_test_week4_fixed.c -lm -o external_sort
+gcc -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -O2 stress_test_week4.c -lm -o external_sort
 ```
 
 Or compile with Clang:
 
 ```bash
-clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -O2 stress_test_week4_fixed.c -lm -o external_sort
+clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -O2 stress_test_week4.c -lm -o external_sort
 ```
 
 These commands create an executable named `external_sort`.
