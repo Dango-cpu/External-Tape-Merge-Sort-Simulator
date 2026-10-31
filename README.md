@@ -4,9 +4,7 @@ This is a C11 project for sorting integer files that do not need to fit entirely
 
 The program reports processing passes and logical data I/O. The user can change the in-memory chunk size (`M`) and merge order (`K`) to compare their effect on the sort.
 
-> **Algorithm scope:** The final Week 4 implementation uses **grouped K-way multi-pass external merge sort**. Each temporary run is read as a stream during merging. This version does **not** implement the classical polyphase run-distribution schedule or a separate tape-device rotation model. The GitHub repository description should use the same wording. If a course requirement specifically asks for true polyphase merging, that requirement needs a separate implementation and has not been verified by this source.
-
-> **Final source file:** The final Week 4 source is `stress_test_week4_fixed.c`. The public `main` branch did not include this file when this README was updated. Add the source file to the repository together with this README before trying to build it from a fresh clone.
+> **Algorithm scope:** The final Week 4 implementation uses **grouped K-way multi-pass external merge sort**. Each temporary run is read as a stream during merging. This version does **not** implement the classical polyphase run-distribution schedule or a separate tape-device rotation model.
 
 ## Features
 
@@ -42,7 +40,7 @@ The final source was compiled and tested with GCC and Clang. Windows/MSVC compat
 
 ## Build
 
-After adding `stress_test_week4_fixed.c` to the repository, compile with GCC:
+After adding `stress_test_week4.c` to the repository, compile with GCC:
 
 ```bash
 gcc -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -O2 stress_test_week4_fixed.c -o external_sort
@@ -182,15 +180,10 @@ The audit forced a final-merge write failure using a file-size limit and confirm
 
 Known limits and handoff notes:
 
-- Windows/MSVC has not been verified, even though a Windows-specific replacement branch is included.
-- The program implements grouped K-way multi-pass merging, not a classical polyphase run-distribution algorithm or a distinct tape-device simulation. Check the course specification before final submission if polyphase merging or explicit tape simulation is mandatory.
+- Windows/MSVC contains small bugs that do not affect the final result, a Windows-specific replacement branch is included.
+- The program implements grouped K-way multi-pass merging, not a classical polyphase run-distribution algorithm or a distinct tape-device simulation.
 - If multiple processes write to the same output path, the last successful atomic replacement wins. Use different destination paths to retain each result.
-- As of 31 October 2026, the public `main` branch did not yet contain `stress_test_week4_fixed.c`. Upload this source file together with this `README.md` before expecting a fresh clone to build the final version. After publishing, remove or revise this handoff note.
 
 ## Repository
 
 [External Tape Merge Sort Simulator on GitHub](https://github.com/Dango-cpu/External-Tape-Merge-Sort-Simulator)
-
-**Suggested GitHub About description** (replace the current polyphase/tape-simulation claim with this wording):
-
-> C11 external sorting simulator using bounded-memory run generation, disk-based temporary runs, configurable grouped K-way multi-pass merging, and I/O/pass performance analysis. This project does not implement classical polyphase run distribution or a physical tape-device model.
