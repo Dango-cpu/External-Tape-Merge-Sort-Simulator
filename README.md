@@ -32,7 +32,7 @@ The program uses bounded chunks for run generation, so it does not need to load 
 - A command-line terminal.
 - The standard C library.
 
-Caution: Window/MSVC may encounter small errors (unaffected to the final result), there may exist more errors concerning this compiler. We recommend you use GCC or Clang for a more stable experience.
+Caution: Windows/MSVC may encounter small errors (that do not affect the final result). There may exist more errors concerning this compiler. We recommend you use GCC or Clang for a more stable experience.
 
 ## Build
 
