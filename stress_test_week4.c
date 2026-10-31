@@ -1,10 +1,10 @@
 /*
- * External sort and k-way merging benchmark (C11).
+ * External sort and grouped k-way merging benchmark (C11).
  *
  * Build:
- *    GCC:   gcc -std=c11 -Wall -Wextra -Wpedantic -O2 stress_test_week4_fixed.c -lm -o external_sort
- *    Clang: clang -std=c11 -Wall -Wextra -Wpedantic -O2 stress_test_week4_fixed.c -lm -o external_sort
- *    MSVC:  cl /std:c11 /W4 /O2 stress_test_week4_fixed.c /Fe:external_sort.exe
+ *    GCC:   gcc -std=c11 -Wall -Wextra -Wpedantic -O2 stress_test_week4_fixed.c -o external_sort
+ *    Clang: clang -std=c11 -Wall -Wextra -Wpedantic -O2 stress_test_week4_fixed.c -o external_sort
+ *    MSVC (not yet verified): cl /std:c11 /W4 /O2 stress_test_week4_fixed.c /Fe:external_sort.exe
  *
  * Usage:
  *    ./external_sort                      Run benchmark table (N = 5k, 20k, 100k, 1,000k)
@@ -17,12 +17,21 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
-#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#if !defined(_WIN32) && defined(__unix__)
+#include <signal.h>
+#include <sys/resource.h>
+#endif
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 #define DEFAULT_M 1000
 #define DEFAULT_K 2
@@ -58,6 +67,96 @@ typedef struct {
 
 static unsigned long long g_temp_counter = 0;
 
+/*
+ * Create a unique temporary file in the same directory as base_path.
+ * fopen(..., "wx") uses C11 exclusive creation: an existing file is never
+ * truncated. If another process wins a name race, retry with a new suffix.
+ * Keeping the file beside the destination also keeps final rename/replace on
+ * the same filesystem, which is required for atomic replacement on POSIX.
+ */
+static char *create_temp_file_near(const char *base_path,
+                                   size_t pass,
+                                   size_t index,
+                                   FILE **file_out) {
+    const char *last_sep;
+    size_t directory_length;
+    const char *separator;
+    size_t attempt;
+
+    if (base_path == NULL || file_out == NULL) return NULL;
+    *file_out = NULL;
+
+    last_sep = strrchr(base_path, '/');
+#ifdef _WIN32
+    {
+        const char *backslash = strrchr(base_path, '\\');
+        if (backslash != NULL && (last_sep == NULL || backslash > last_sep))
+            last_sep = backslash;
+    }
+#endif
+    if (last_sep != NULL) {
+        directory_length = (size_t)(last_sep - base_path) + 1;
+        if (directory_length > (size_t)INT_MAX) return NULL;
+        separator = "";
+    } else {
+        directory_length = 0;
+#ifdef _WIN32
+        separator = ".\\";
+#else
+        separator = "./";
+#endif
+    }
+
+    for (attempt = 0; attempt < 10000; ++attempt) {
+        struct timespec now;
+        unsigned long long serial = ++g_temp_counter;
+        unsigned long long seconds;
+        unsigned long long nanoseconds;
+        int needed;
+        char *path;
+        FILE *stream;
+
+        if (timespec_get(&now, TIME_UTC) == TIME_UTC) {
+            seconds = (unsigned long long)now.tv_sec;
+            nanoseconds = (unsigned long long)now.tv_nsec;
+        } else {
+            seconds = (unsigned long long)time(NULL);
+            nanoseconds = 0;
+        }
+
+        needed = snprintf(NULL, 0,
+                          "%.*s%s.extsort_%llu_%llu_%llu_%zu_%zu.tmp",
+                          (int)directory_length, base_path, separator,
+                          seconds, nanoseconds, serial, pass, index);
+        if (needed < 0) return NULL;
+        path = (char *)malloc((size_t)needed + 1);
+        if (path == NULL) return NULL;
+        if (snprintf(path, (size_t)needed + 1,
+                     "%.*s%s.extsort_%llu_%llu_%llu_%zu_%zu.tmp",
+                     (int)directory_length, base_path, separator,
+                     seconds, nanoseconds, serial, pass, index) != needed) {
+            free(path);
+            return NULL;
+        }
+
+        stream = fopen(path, "wx");
+        if (stream != NULL) {
+            *file_out = stream;
+            return path;
+        }
+        {
+            int saved_errno = errno;
+            free(path);
+            if (saved_errno != EEXIST) {
+                errno = saved_errno;
+                return NULL;
+            }
+        }
+    }
+    errno = EEXIST;
+    return NULL;
+}
+
 static bool run_list_push_owned(RunList *list, char *path) {
     char **new_items;
     size_t new_capacity;
@@ -66,9 +165,8 @@ static bool run_list_push_owned(RunList *list, char *path) {
     if (list->count == list->capacity) {
         new_capacity = (list->capacity == 0) ? 8 : list->capacity * 2;
         if (new_capacity < list->capacity ||
-            new_capacity > ((size_t)-1) / sizeof(*list->items)) {
+            new_capacity > ((size_t)-1) / sizeof(*list->items))
             return false;
-        }
         new_items = (char **)realloc(list->items, new_capacity * sizeof(*list->items));
         if (new_items == NULL) return false;
         list->items = new_items;
@@ -78,12 +176,39 @@ static bool run_list_push_owned(RunList *list, char *path) {
     return true;
 }
 
+static bool remove_owned_file(const char *path, const char *purpose) {
+    if (path == NULL) return true;
+    if (remove(path) == 0 || errno == ENOENT) return true;
+    fprintf(stderr, "Warning: cannot remove %s '%s': %s\n",
+            purpose != NULL ? purpose : "temporary file", path, strerror(errno));
+    return false;
+}
+
+/* Replace destination only after source is complete. Both paths are created
+ * in the same directory, so this operation is atomic on POSIX filesystems. */
+static bool replace_file(const char *source, const char *destination) {
+#ifdef _WIN32
+    if (MoveFileExA(source, destination,
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0)
+        return true;
+    fprintf(stderr, "Error: cannot replace output file '%s' (Windows error %lu).\n",
+            destination, (unsigned long)GetLastError());
+    return false;
+#else
+    if (rename(source, destination) == 0) return true;
+    fprintf(stderr, "Error: cannot replace output file '%s': %s\n",
+            destination, strerror(errno));
+    return false;
+#endif
+}
+
 static void run_list_destroy(RunList *list, bool remove_files) {
     size_t i;
     if (list == NULL) return;
     for (i = 0; i < list->count; ++i) {
         if (list->items[i] != NULL) {
-            if (remove_files) (void)remove(list->items[i]);
+            if (remove_files)
+                (void)remove_owned_file(list->items[i], "temporary run");
             free(list->items[i]);
         }
     }
@@ -91,26 +216,6 @@ static void run_list_destroy(RunList *list, bool remove_files) {
     list->items = NULL;
     list->count = 0;
     list->capacity = 0;
-}
-
-static char *make_temp_path(const char *output_file, size_t pass, size_t index) {
-    int needed;
-    char *path;
-    unsigned long long serial = ++g_temp_counter;
-    unsigned long long timestamp = (unsigned long long)time(NULL);
-
-    needed = snprintf(NULL, 0, "%s.extsort_%llu_%llu_%zu_%zu.tmp",
-                      output_file, timestamp, serial, pass, index);
-    if (needed < 0) return NULL;
-    path = (char *)malloc((size_t)needed + 1);
-    if (path == NULL) return NULL;
-    if (snprintf(path, (size_t)needed + 1,
-                 "%s.extsort_%llu_%llu_%zu_%zu.tmp",
-                 output_file, timestamp, serial, pass, index) != needed) {
-        free(path);
-        return NULL;
-    }
-    return path;
 }
 
 static int read_next_int(FILE *stream, int *value, IOStats *stats) {
@@ -123,6 +228,12 @@ static int read_next_int(FILE *stream, int *value, IOStats *stats) {
     long parsed;
 
     if (stream == NULL || value == NULL) return -1;
+    if (ferror(stream)) {
+        fprintf(stderr, "Error: failed while reading a data file.\n");
+        return -1;
+    }
+    /* The previous token may already have consumed EOF; avoid probing again. */
+    if (feof(stream)) return 0;
 
     do {
         c = fgetc(stream);
@@ -284,7 +395,7 @@ static bool create_initial_runs(const char *input_file, const char *output_file,
     buffer = (int *)malloc(M * sizeof(*buffer));
     if (buffer == NULL) {
         fprintf(stderr, "Error: cannot allocate the M-sized RAM buffer.\n");
-        fclose(input);
+        (void)fclose(input);
         return false;
     }
 
@@ -301,18 +412,14 @@ static bool create_initial_runs(const char *input_file, const char *output_file,
 
         qsort(buffer, count, sizeof(*buffer), compare_ints);
         {
-            char *run_path = make_temp_path(output_file, 0, runs->count);
-            FILE *run_file;
+            FILE *run_file = NULL;
+            char *run_path = create_temp_file_near(output_file, 0, runs->count,
+                                                   &run_file);
             size_t i;
             bool write_ok = true;
-            if (run_path == NULL) {
-                fprintf(stderr, "Error: cannot allocate a temporary run path.\n");
-                goto cleanup;
-            }
-            run_file = fopen(run_path, "w");
-            if (run_file == NULL) {
-                fprintf(stderr, "Error: cannot create temporary run '%s': %s\n",
-                        run_path, strerror(errno));
+            if (run_path == NULL || run_file == NULL) {
+                fprintf(stderr, "Error: cannot create a unique temporary run: %s\n",
+                        strerror(errno));
                 free(run_path);
                 goto cleanup;
             }
@@ -325,13 +432,13 @@ static bool create_initial_runs(const char *input_file, const char *output_file,
             if (fclose(run_file) != 0) write_ok = false;
             if (!write_ok) {
                 fprintf(stderr, "Error: failed to write a temporary run.\n");
-                (void)remove(run_path);
+                (void)remove_owned_file(run_path, "temporary run");
                 free(run_path);
                 goto cleanup;
             }
             if (!run_list_push_owned(runs, run_path)) {
                 fprintf(stderr, "Error: cannot grow the temporary-run list.\n");
-                (void)remove(run_path);
+                (void)remove_owned_file(run_path, "temporary run");
                 free(run_path);
                 goto cleanup;
             }
@@ -350,14 +457,17 @@ cleanup:
 }
 
 static bool merge_runs(char *const input_runs[], size_t num_runs,
-                       const char *output_file, IOStats *stats) {
+                       const char *temp_base, size_t pass, size_t index,
+                       IOStats *stats, char **output_run_path) {
     FILE **input_files = NULL;
-    MinHeap *heap = NULL;
     FILE *output = NULL;
+    MinHeap *heap = NULL;
+    char *temp_path = NULL;
     bool ok = false;
     size_t i;
 
-    if (num_runs == 0) return false;
+    if (output_run_path == NULL || num_runs == 0) return false;
+    *output_run_path = NULL;
     if (num_runs > ((size_t)-1) / sizeof(*input_files)) return false;
     input_files = (FILE **)calloc(num_runs, sizeof(*input_files));
     if (input_files == NULL) {
@@ -387,10 +497,10 @@ static bool merge_runs(char *const input_runs[], size_t num_runs,
         }
     }
 
-    output = fopen(output_file, "w");
-    if (output == NULL) {
-        fprintf(stderr, "Error: cannot create output file '%s': %s\n",
-                output_file, strerror(errno));
+    temp_path = create_temp_file_near(temp_base, pass, index, &output);
+    if (temp_path == NULL || output == NULL) {
+        fprintf(stderr, "Error: cannot create a unique merge output file: %s\n",
+                strerror(errno));
         goto cleanup;
     }
 
@@ -399,7 +509,8 @@ static bool merge_runs(char *const input_runs[], size_t num_runs,
         int next_value;
         int status;
         if (!write_int(output, smallest.value, stats)) {
-            fprintf(stderr, "Error: failed while writing output file '%s'.\n", output_file);
+            fprintf(stderr, "Error: failed while writing merge temporary file '%s'.\n",
+                    temp_path);
             goto cleanup;
         }
         status = read_next_int(input_files[smallest.run_id], &next_value, stats);
@@ -412,51 +523,56 @@ static bool merge_runs(char *const input_runs[], size_t num_runs,
 
     if (fclose(output) != 0) {
         output = NULL;
-        fprintf(stderr, "Error: failed to finish writing '%s'.\n", output_file);
+        fprintf(stderr, "Error: failed to finish merge temporary file '%s'.\n", temp_path);
         goto cleanup;
     }
     output = NULL;
     ok = true;
 
 cleanup:
-    if (output != NULL && fclose(output) != 0) ok = false;
+    if (output != NULL) {
+        if (fclose(output) != 0) ok = false;
+    }
     if (input_files != NULL) {
         for (i = 0; i < num_runs; ++i) {
-            if (input_files[i] != NULL && fclose(input_files[i]) != 0) ok = false;
+            if (input_files[i] != NULL && fclose(input_files[i]) != 0) {
+                fprintf(stderr, "Error: failed to close temporary input run '%s'.\n",
+                        input_runs[i]);
+                ok = false;
+            }
         }
     }
-    if (!ok) (void)remove(output_file);
+    if (!ok && temp_path != NULL)
+        (void)remove_owned_file(temp_path, "incomplete merge file");
     free(input_files);
     heap_destroy(heap);
+
+    if (ok) *output_run_path = temp_path;
+    else free(temp_path);
     return ok;
 }
 
 static bool create_empty_output(const char *output_file) {
-    FILE *output = fopen(output_file, "w");
-    if (output == NULL) {
-        fprintf(stderr, "Error: cannot create output file '%s': %s\n",
+    FILE *output = NULL;
+    char *temp_path = create_temp_file_near(output_file, 0, 0, &output);
+    bool ok;
+    if (temp_path == NULL || output == NULL) {
+        fprintf(stderr, "Error: cannot create temporary output beside '%s': %s\n",
                 output_file, strerror(errno));
+        free(temp_path);
         return false;
     }
-    if (fclose(output) != 0) {
-        fprintf(stderr, "Error: failed to close output file '%s'.\n", output_file);
-        return false;
-    }
-    return true;
+    ok = fclose(output) == 0;
+    if (!ok) fprintf(stderr, "Error: failed to finish temporary empty output.\n");
+    if (ok) ok = replace_file(temp_path, output_file);
+    if (!ok) (void)remove_owned_file(temp_path, "temporary output");
+    free(temp_path);
+    return ok;
 }
 
 static bool move_single_run_to_output(const char *run_path, const char *output_file) {
-    if (remove(output_file) != 0 && errno != ENOENT) {
-        fprintf(stderr, "Error: cannot replace output file '%s': %s\n",
-                output_file, strerror(errno));
-        return false;
-    }
-    if (rename(run_path, output_file) != 0) {
-        fprintf(stderr, "Error: cannot move the final run to '%s': %s\n",
-                output_file, strerror(errno));
-        return false;
-    }
-    return true;
+    /* rename/MoveFileEx replaces only after the completed run already exists. */
+    return replace_file(run_path, output_file);
 }
 
 static int external_sort(const char *input_file, const char *output_file,
@@ -498,11 +614,15 @@ static int external_sort(const char *input_file, const char *output_file,
         bool final_pass = current.count <= (size_t)K;
 
         if (final_pass) {
-            if (!merge_runs(current.items, current.count, output_file, stats)) {
-                run_list_destroy(&current, true);
-                return -1;
-            }
+            char *final_path = NULL;
+            bool merged = merge_runs(current.items, current.count, output_file,
+                                     stats->merge_passes + 1, 0, stats, &final_path);
+            if (merged) merged = replace_file(final_path, output_file);
+            if (!merged && final_path != NULL)
+                (void)remove_owned_file(final_path, "final temporary output");
+            free(final_path);
             run_list_destroy(&current, true);
+            if (!merged) return -1;
             stats->merge_passes++;
             stats->total_passes++;
             return 0;
@@ -522,24 +642,17 @@ static int external_sort(const char *input_file, const char *output_file,
                 }
                 current.items[i] = NULL;
             } else {
-                char *new_path = make_temp_path(output_file,
-                                                stats->merge_passes + 1,
-                                                next.count);
-                if (new_path == NULL) {
-                    fprintf(stderr, "Error: cannot allocate a merge-run path.\n");
-                    run_list_destroy(&next, true);
-                    run_list_destroy(&current, true);
-                    return -1;
-                }
-                if (!merge_runs(&current.items[i], group_count, new_path, stats)) {
-                    free(new_path);
+                char *new_path = NULL;
+                if (!merge_runs(&current.items[i], group_count, output_file,
+                                stats->merge_passes + 1, next.count,
+                                stats, &new_path)) {
                     run_list_destroy(&next, true);
                     run_list_destroy(&current, true);
                     return -1;
                 }
                 if (!run_list_push_owned(&next, new_path)) {
                     fprintf(stderr, "Error: cannot grow the next-run list.\n");
-                    (void)remove(new_path);
+                    (void)remove_owned_file(new_path, "new merge run");
                     free(new_path);
                     run_list_destroy(&next, true);
                     run_list_destroy(&current, true);
@@ -548,7 +661,7 @@ static int external_sort(const char *input_file, const char *output_file,
                 {
                     size_t j;
                     for (j = 0; j < group_count; ++j) {
-                        (void)remove(current.items[i + j]);
+                        (void)remove_owned_file(current.items[i + j], "consumed input run");
                         free(current.items[i + j]);
                         current.items[i + j] = NULL;
                     }
@@ -575,25 +688,15 @@ static int external_sort(const char *input_file, const char *output_file,
     return create_empty_output(output_file) ? 0 : -1;
 }
 
-static bool generate_random_file(const char *filename, int count) {
-    FILE *file = fopen(filename, "w");
+static bool generate_random_file(FILE *file, int count) {
     int i;
-    if (file == NULL) {
-        fprintf(stderr, "Error: cannot create benchmark input '%s': %s\n",
-                filename, strerror(errno));
-        return false;
-    }
+    if (file == NULL) return false;
     srand(42);
     for (i = 0; i < count; ++i) {
         if (fprintf(file, "%d\n", rand() % 1000000) < 0) {
             fprintf(stderr, "Error: failed while generating benchmark input.\n");
-            fclose(file);
             return false;
         }
-    }
-    if (fclose(file) != 0) {
-        fprintf(stderr, "Error: failed to finish benchmark input '%s'.\n", filename);
-        return false;
     }
     return true;
 }
@@ -608,15 +711,48 @@ static size_t theoretical_total_passes(size_t initial_runs, size_t K) {
     return 1 + levels;
 }
 
-/* BENCHMARK TIÊU CHUẨN: ĐÃ ĐƯỢC TÍCH HỢP TRỰC TIẾP N = 1,000,000 BẢN GHI */
+/* Benchmark files are uniquely created and owned by this invocation. */
 static int run_benchmark(void) {
     const int M = DEFAULT_M;
-    // Bổ sung N = 1,000,000 vào thẳng bảng output benchmark mặc định
     const int file_sizes[] = {5000, 20000, 100000, 1000000};
     const int k_values[] = {2, 3, 5, 10};
-    const char *input_file = "benchmark_input.txt";
-    const char *output_file = "benchmark_output.txt";
+    char *input_file = NULL;
+    char *output_file = NULL;
+    FILE *input_stream = NULL;
+    FILE *output_reservation = NULL;
     size_t s;
+    int exit_code = 1;
+
+    input_file = create_temp_file_near("benchmark_input", 0, 0, &input_stream);
+    if (input_file == NULL || input_stream == NULL) {
+        fprintf(stderr, "Error: cannot create unique benchmark input: %s\n", strerror(errno));
+        free(input_file);
+        return 1;
+    }
+    if (fclose(input_stream) != 0) {
+        fprintf(stderr, "Error: cannot close benchmark input reservation.\n");
+        (void)remove_owned_file(input_file, "benchmark input");
+        free(input_file);
+        return 1;
+    }
+    input_stream = NULL;
+
+    output_file = create_temp_file_near("benchmark_output", 0, 0, &output_reservation);
+    if (output_file == NULL || output_reservation == NULL) {
+        fprintf(stderr, "Error: cannot reserve unique benchmark output: %s\n", strerror(errno));
+        (void)remove_owned_file(input_file, "benchmark input");
+        free(input_file);
+        free(output_file);
+        return 1;
+    }
+    if (fclose(output_reservation) != 0) {
+        fprintf(stderr, "Error: cannot close benchmark output reservation.\n");
+        (void)remove_owned_file(input_file, "benchmark input");
+        (void)remove_owned_file(output_file, "benchmark output");
+        free(input_file);
+        free(output_file);
+        return 1;
+    }
 
     printf("===============================================================================================\n");
     printf("              EXTERNAL SORT BENCHMARK: FILE SIZE, K-WAY MERGE, PASSES AND I/O                  \n");
@@ -630,7 +766,24 @@ static int run_benchmark(void) {
         printf("| K | Initial runs | Actual passes | Theoretical passes | Bytes read | Bytes written | Total I/O (MiB) | CPU time (ms) |\n");
         printf("---------------------------------------------------------------------------------------------------------------\n");
 
-        if (!generate_random_file(input_file, N)) return 1;
+        input_stream = fopen(input_file, "w");
+        if (input_stream == NULL) {
+            fprintf(stderr, "Error: cannot open owned benchmark input '%s': %s\n",
+                    input_file, strerror(errno));
+            goto cleanup;
+        }
+        if (!generate_random_file(input_stream, N)) {
+            (void)fclose(input_stream);
+            input_stream = NULL;
+            goto cleanup;
+        }
+        if (fclose(input_stream) != 0) {
+            input_stream = NULL;
+            fprintf(stderr, "Error: cannot finish benchmark input.\n");
+            goto cleanup;
+        }
+        input_stream = NULL;
+
         for (k_idx = 0; k_idx < sizeof(k_values) / sizeof(k_values[0]); ++k_idx) {
             int K = k_values[k_idx];
             IOStats stats;
@@ -641,43 +794,140 @@ static int run_benchmark(void) {
             size_t theoretical;
 
             if (external_sort(input_file, output_file, M, K, &stats) != 0) {
-                (void)remove(input_file);
-                (void)remove(output_file);
-                return 1;
+                fprintf(stderr, "Error: benchmark sort failed for N=%d, K=%d.\n", N, K);
+                goto cleanup;
             }
             end = clock();
-            time_ms = ((double)(end - start) / (double)CLOCKS_PER_SEC) * 1000.0;
+            if (start == (clock_t)-1 || end == (clock_t)-1) time_ms = -1.0;
+            else time_ms = ((double)(end - start) / (double)CLOCKS_PER_SEC) * 1000.0;
             total_io_mb = (double)(stats.bytes_read + stats.bytes_written) / (1024.0 * 1024.0);
             theoretical = theoretical_total_passes(stats.initial_runs, (size_t)K);
 
             printf("| %-1d | %-12zu | %-13zu | %-18zu | %-10llu | %-13llu | %-14.3f | %-9.2f |\n",
                    K, stats.initial_runs, stats.total_passes, theoretical,
                    stats.bytes_read, stats.bytes_written, total_io_mb, time_ms);
-            if (remove(output_file) != 0 && errno != ENOENT) {
-                fprintf(stderr, "Warning: could not remove benchmark output '%s'.\n", output_file);
-            }
         }
-        (void)remove(input_file);
     }
     printf("===============================================================================================\n");
-    return 0;
+    exit_code = 0;
+
+cleanup:
+    if (input_stream != NULL && fclose(input_stream) != 0)
+        fprintf(stderr, "Warning: failed to close benchmark input stream.\n");
+    (void)remove_owned_file(input_file, "benchmark input");
+    (void)remove_owned_file(output_file, "benchmark output");
+    free(input_file);
+    free(output_file);
+    return exit_code;
 }
 
-/* BỘ CHẠY LỖI ÉP TẢI VÀ LỖI ĐƯỜNG DẪN TỆP (--stress) */
+static bool file_matches_text(const char *filename, const char *expected_text);
+
+/* Stress tests create unique fixtures and remove only files owned by this run. */
+#if !defined(_WIN32) && defined(__unix__) && defined(RLIMIT_FSIZE) && defined(SIGXFSZ)
+/* Return 1 on pass, 0 on failure, and -1 when this platform cannot run the check. */
+static int stress_final_write_failure_preserves_output(void) {
+    char *input_path = NULL;
+    char *output_path = NULL;
+    FILE *input = NULL;
+    FILE *output = NULL;
+    struct rlimit original_limit;
+    struct rlimit limited_limit;
+    void (*original_handler)(int) = SIG_DFL;
+    bool handler_changed = false;
+    bool limit_changed = false;
+    bool setup_ok = true;
+    bool preserved = false;
+    int sort_result = 0;
+    int i;
+    IOStats stats;
+
+    input_path = create_temp_file_near("stress_final_write_input", 0, 0, &input);
+    if (input_path == NULL || input == NULL) setup_ok = false;
+    if (setup_ok) {
+        /* Each 100-record run stays below 512 bytes; the merged result exceeds it. */
+        for (i = 0; i < 300; ++i) {
+            if (fprintf(input, "%d\n", i) < 0) {
+                setup_ok = false;
+                break;
+            }
+        }
+        if (fclose(input) != 0) setup_ok = false;
+        input = NULL;
+    }
+
+    output_path = create_temp_file_near("stress_final_write_output", 0, 0, &output);
+    if (output_path == NULL || output == NULL) setup_ok = false;
+    if (setup_ok) {
+        if (fputs("PRESERVE_FINAL_OUTPUT\n", output) == EOF) setup_ok = false;
+        if (fclose(output) != 0) setup_ok = false;
+        output = NULL;
+    }
+
+    if (!setup_ok) goto cleanup;
+    if (getrlimit(RLIMIT_FSIZE, &original_limit) != 0) goto unsupported;
+    if (original_limit.rlim_max != RLIM_INFINITY && original_limit.rlim_max < (rlim_t)512)
+        goto unsupported;
+
+    limited_limit = original_limit;
+    limited_limit.rlim_cur = (rlim_t)512;
+    original_handler = signal(SIGXFSZ, SIG_IGN);
+    if (original_handler == SIG_ERR) goto cleanup;
+    handler_changed = true;
+    if (setrlimit(RLIMIT_FSIZE, &limited_limit) != 0) goto cleanup;
+    limit_changed = true;
+
+    (void)fflush(stdout);
+    sort_result = external_sort(input_path, output_path, 100, 3, &stats);
+
+    if (setrlimit(RLIMIT_FSIZE, &original_limit) != 0) {
+        fprintf(stderr, "Error: could not restore the original file-size limit.\n");
+        goto cleanup;
+    }
+    limit_changed = false;
+    if (signal(SIGXFSZ, original_handler) == SIG_ERR) goto cleanup;
+    handler_changed = false;
+
+    if (sort_result == 0 || stats.initial_runs != 3) goto cleanup;
+    preserved = file_matches_text(output_path, "PRESERVE_FINAL_OUTPUT\n");
+    goto cleanup;
+
+unsupported:
+    fprintf(stderr, " -> Status: SKIP (RLIMIT_FSIZE cannot be set to the required test limit)\n");
+    if (input != NULL) { (void)fclose(input); input = NULL; }
+    if (output != NULL) { (void)fclose(output); output = NULL; }
+    (void)remove_owned_file(input_path, "stress input");
+    (void)remove_owned_file(output_path, "stress output");
+    free(input_path);
+    free(output_path);
+    return -1;
+
+cleanup:
+    if (limit_changed && setrlimit(RLIMIT_FSIZE, &original_limit) != 0)
+        fprintf(stderr, "Error: could not restore the original file-size limit.\n");
+    if (handler_changed && signal(SIGXFSZ, original_handler) == SIG_ERR)
+        fprintf(stderr, "Error: could not restore the original SIGXFSZ handler.\n");
+    if (input != NULL) (void)fclose(input);
+    if (output != NULL) (void)fclose(output);
+    (void)remove_owned_file(input_path, "stress input");
+    (void)remove_owned_file(output_path, "stress output");
+    free(input_path);
+    free(output_path);
+    return preserved ? 1 : 0;
+}
+#endif
+
 static int run_stress_test(void) {
     int failures = 0;
-    const char *malformed_in = "stress_malformed.txt";
-    const char *malformed_out = "stress_malformed_out.txt";
-    const char *overlong_in = "stress_overlong.txt";
-    const char *overlong_out = "stress_overlong_out.txt";
-    const char *nul_in = "stress_nul.txt";
-    const char *nul_out = "stress_nul_out.txt";
-    const char *valid_in = "stress_valid.txt";
-    const char *bad_out_path = "."; /* Existing directory: temp runs can be created, final output cannot. */
-    FILE *file;
+    char *malformed_in = NULL, *malformed_out = NULL;
+    char *overlong_in = NULL, *overlong_out = NULL;
+    char *nul_in = NULL, *nul_out = NULL;
+    char *valid_in = NULL;
+    char *preserve_in = NULL, *preserve_out = NULL;
+    FILE *file = NULL;
     IOStats stats;
     int result;
-    bool setup_ok;
+    int total_tests = 5;
     size_t i;
 
     printf("===============================================================================================\n");
@@ -686,94 +936,145 @@ static int run_stress_test(void) {
 
     printf("\n[STRESS TEST 1] Malformed Integer Token Rejection\n");
     printf("-----------------------------------------------------------------------------------------------\n");
-    (void)remove(malformed_in);
-    (void)remove(malformed_out);
-    file = fopen(malformed_in, "w");
-    setup_ok = file != NULL;
-    if (setup_ok) {
-        setup_ok = fputs("100\n \t\r\n 200 \n invalid_string_token \n 300\n", file) != EOF;
-        if (fclose(file) != 0) setup_ok = false;
-    }
-    result = setup_ok ? external_sort(malformed_in, malformed_out, 5, 2, &stats) : 0;
-    if (setup_ok && result != 0) {
-        printf(" -> Status: PASS (malformed token rejected)\n");
-    } else {
-        printf(" -> Status: FAIL (test setup or rejection failed)\n");
-        failures++;
-    }
-    (void)remove(malformed_in);
-    (void)remove(malformed_out);
+    malformed_in = create_temp_file_near("stress_malformed_input", 0, 0, &file);
+    if (malformed_in != NULL && file != NULL) {
+        bool ok = fputs("100\n \t\r\n 200 \n invalid_string_token \n 300\n", file) != EOF;
+        if (fclose(file) != 0) ok = false;
+        file = NULL;
+        malformed_out = create_temp_file_near("stress_malformed_output", 0, 0, &file);
+        if (file != NULL) { if (fclose(file) != 0) ok = false; file = NULL; }
+        result = (ok && malformed_out != NULL) ? external_sort(malformed_in, malformed_out, 5, 2, &stats) : 0;
+        if (ok && malformed_out != NULL && result != 0) printf(" -> Status: PASS (malformed token rejected)\n");
+        else { printf(" -> Status: FAIL (fixture creation or rejection failed)\n"); failures++; }
+    } else { printf(" -> Status: FAIL (cannot create fixture)\n"); failures++; }
 
     printf("\n[STRESS TEST 2] Overlong Integer Token Rejection\n");
     printf("-----------------------------------------------------------------------------------------------\n");
-    (void)remove(overlong_in);
-    (void)remove(overlong_out);
-    file = fopen(overlong_in, "w");
-    setup_ok = file != NULL;
-    if (setup_ok) {
-        for (i = 0; i < TOKEN_BUFFER_SIZE + 20; ++i) {
-            if (fputc('9', file) == EOF) setup_ok = false;
-        }
-        if (fputc('\n', file) == EOF) setup_ok = false;
-        if (fclose(file) != 0) setup_ok = false;
-    }
-    result = setup_ok ? external_sort(overlong_in, overlong_out, 5, 2, &stats) : 0;
-    if (setup_ok && result != 0) {
-        printf(" -> Status: PASS (overlong token rejected)\n");
-    } else {
-        printf(" -> Status: FAIL (test setup or rejection failed)\n");
-        failures++;
-    }
-    (void)remove(overlong_in);
-    (void)remove(overlong_out);
+    overlong_in = create_temp_file_near("stress_overlong_input", 0, 0, &file);
+    if (overlong_in != NULL && file != NULL) {
+        bool ok = true;
+        for (i = 0; i < TOKEN_BUFFER_SIZE + 20; ++i)
+            if (fputc('9', file) == EOF) ok = false;
+        if (fputc('\n', file) == EOF) ok = false;
+        if (fclose(file) != 0) ok = false;
+        file = NULL;
+        overlong_out = create_temp_file_near("stress_overlong_output", 0, 0, &file);
+        if (file != NULL) { if (fclose(file) != 0) ok = false; file = NULL; }
+        result = (ok && overlong_out != NULL) ? external_sort(overlong_in, overlong_out, 5, 2, &stats) : 0;
+        if (ok && overlong_out != NULL && result != 0) printf(" -> Status: PASS (overlong token rejected)\n");
+        else { printf(" -> Status: FAIL (fixture creation or rejection failed)\n"); failures++; }
+    } else { printf(" -> Status: FAIL (cannot create fixture)\n"); failures++; }
 
     printf("\n[STRESS TEST 3] Embedded NUL Byte Rejection\n");
     printf("-----------------------------------------------------------------------------------------------\n");
-    (void)remove(nul_in);
-    (void)remove(nul_out);
-    file = fopen(nul_in, "wb");
-    setup_ok = file != NULL;
-    if (setup_ok) {
-        setup_ok = fputs("12", file) != EOF && fputc('\0', file) != EOF &&
-                   fputs("junk\n4\n", file) != EOF;
-        if (fclose(file) != 0) setup_ok = false;
-    }
-    result = setup_ok ? external_sort(nul_in, nul_out, 1, 2, &stats) : 0;
-    if (setup_ok && result != 0) {
-        printf(" -> Status: PASS (binary-corrupted token rejected)\n");
-    } else {
-        printf(" -> Status: FAIL (test setup or rejection failed)\n");
-        failures++;
-    }
-    (void)remove(nul_in);
-    (void)remove(nul_out);
+    nul_in = create_temp_file_near("stress_nul_input", 0, 0, &file);
+    if (nul_in != NULL && file != NULL) {
+        bool ok = fputs("12", file) != EOF && fputc('\0', file) != EOF &&
+                  fputs("junk\n4\n", file) != EOF;
+        if (fclose(file) != 0) ok = false;
+        file = NULL;
+        nul_out = create_temp_file_near("stress_nul_output", 0, 0, &file);
+        if (file != NULL) { if (fclose(file) != 0) ok = false; file = NULL; }
+        result = (ok && nul_out != NULL) ? external_sort(nul_in, nul_out, 1, 2, &stats) : 0;
+        if (ok && nul_out != NULL && result != 0) printf(" -> Status: PASS (binary-corrupted token rejected)\n");
+        else { printf(" -> Status: FAIL (fixture creation or rejection failed)\n"); failures++; }
+    } else { printf(" -> Status: FAIL (cannot create fixture)\n"); failures++; }
 
     printf("\n[STRESS TEST 4] Final Output Destination Failure\n");
     printf("-----------------------------------------------------------------------------------------------\n");
-    (void)remove(valid_in);
-    file = fopen(valid_in, "w");
-    setup_ok = file != NULL;
-    if (setup_ok) {
-        setup_ok = fputs("10\n20\n30\n40\n50\n", file) != EOF;
-        if (fclose(file) != 0) setup_ok = false;
+    valid_in = create_temp_file_near("stress_valid_input", 0, 0, &file);
+    if (valid_in != NULL && file != NULL) {
+        bool ok = fputs("10\n20\n30\n40\n50\n", file) != EOF;
+        if (fclose(file) != 0) ok = false;
+        file = NULL;
+        /* Existing directory: temp runs can be created beside it, but it cannot be replaced. */
+        result = ok ? external_sort(valid_in, ".", 2, 2, &stats) : 0;
+        if (ok && result != 0 && stats.initial_runs == 3)
+            printf(" -> Status: PASS (merge completed to a temp file; replacing a directory was rejected)\n");
+        else { printf(" -> Status: FAIL (expected destination failure was not detected)\n"); failures++; }
+    } else { printf(" -> Status: FAIL (cannot create fixture)\n"); failures++; }
+
+    printf("\n[STRESS TEST 5] Preserve Existing Destination After Input Failure\n");
+    printf("-----------------------------------------------------------------------------------------------\n");
+    preserve_in = create_temp_file_near("stress_preserve_input", 0, 0, &file);
+    if (preserve_in != NULL && file != NULL) {
+        bool ok = fputs("10\n20\ninvalid\n30\n", file) != EOF;
+        if (fclose(file) != 0) ok = false;
+        file = NULL;
+        preserve_out = create_temp_file_near("stress_preserve_output", 0, 0, &file);
+        if (preserve_out != NULL && file != NULL) {
+            if (fputs("PRESERVE_ME\n", file) == EOF) ok = false;
+            if (fclose(file) != 0) ok = false;
+            file = NULL;
+        } else ok = false;
+        result = ok ? external_sort(preserve_in, preserve_out, 1, 2, &stats) : 0;
+        if (ok && result != 0) {
+            bool preserved = file_matches_text(preserve_out, "PRESERVE_ME\n");
+            if (preserved) printf(" -> Status: PASS (pre-existing destination contents preserved)\n");
+            else { printf(" -> Status: FAIL (existing destination changed after failed input)\n"); failures++; }
+        } else { printf(" -> Status: FAIL (could not trigger malformed-input failure)\n"); failures++; }
+    } else { printf(" -> Status: FAIL (cannot create fixture)\n"); failures++; }
+
+#if !defined(_WIN32) && defined(__unix__) && defined(RLIMIT_FSIZE) && defined(SIGXFSZ)
+    total_tests++;
+    printf("\n[STRESS TEST 6] Preserve Existing Destination After Final Merge Write Failure\n");
+    printf("-----------------------------------------------------------------------------------------------\n");
+    {
+        int write_failure_result = stress_final_write_failure_preserves_output();
+        if (write_failure_result > 0) {
+            printf(" -> Status: PASS (final merge write failed; existing destination was preserved)\n");
+        } else if (write_failure_result == 0) {
+            printf(" -> Status: FAIL (destination was not preserved after final write failure)\n");
+            failures++;
+        } else {
+            total_tests--;
+            printf(" -> Status: SKIP (file-size limit test is unavailable on this system)\n");
+        }
     }
-    /* With M=2 and K=2, three initial runs force a merge before the final write to '.'. */
-    result = setup_ok ? external_sort(valid_in, bad_out_path, 2, 2, &stats) : 0;
-    if (setup_ok && result != 0 && stats.initial_runs == 3) {
-        printf(" -> Status: PASS (temporary runs were created; final output open failed as expected)\n");
-    } else {
-        printf(" -> Status: FAIL (test setup or final-output failure was not detected)\n");
-        failures++;
-    }
-    (void)remove(valid_in);
+#endif
+
+    if (file != NULL) (void)fclose(file);
+    (void)remove_owned_file(malformed_in, "stress input");
+    (void)remove_owned_file(malformed_out, "stress output");
+    (void)remove_owned_file(overlong_in, "stress input");
+    (void)remove_owned_file(overlong_out, "stress output");
+    (void)remove_owned_file(nul_in, "stress input");
+    (void)remove_owned_file(nul_out, "stress output");
+    (void)remove_owned_file(valid_in, "stress input");
+    (void)remove_owned_file(preserve_in, "stress input");
+    (void)remove_owned_file(preserve_out, "stress output");
+    free(malformed_in); free(malformed_out);
+    free(overlong_in); free(overlong_out);
+    free(nul_in); free(nul_out); free(valid_in);
+    free(preserve_in); free(preserve_out);
 
     printf("===============================================================================================\n");
     if (failures == 0) {
-        printf("                             STRESS TEST SUITE PASSED (4/4)                                   \n");
+        printf("                             STRESS TEST SUITE PASSED (%d/%d)                                  \n", total_tests, total_tests);
         return 0;
     }
-    printf("                             STRESS TEST SUITE FAILED (%d/4)                                  \n", failures);
+    printf("                             STRESS TEST SUITE FAILED (%d failure(s) / %d tests)               \n", failures, total_tests);
     return 1;
+}
+
+static bool file_matches_text(const char *filename, const char *expected_text) {
+    FILE *file;
+    size_t i;
+    bool matches = true;
+    int c;
+    if (filename == NULL || expected_text == NULL) return false;
+    file = fopen(filename, "rb");
+    if (file == NULL) return false;
+    for (i = 0; expected_text[i] != '\0'; ++i) {
+        c = fgetc(file);
+        if (c == EOF || c != (unsigned char)expected_text[i]) {
+            matches = false;
+            break;
+        }
+    }
+    if (matches && (fgetc(file) != EOF || ferror(file))) matches = false;
+    if (fclose(file) != 0) matches = false;
+    return matches;
 }
 
 static bool output_matches(const char *filename, const int *expected, size_t expected_count) {
@@ -812,44 +1113,60 @@ typedef struct {
 } TestCase;
 
 static bool run_one_test(const TestCase *test, size_t number) {
-    char input_path[160];
-    char output_path[160];
-    FILE *input;
+    char *input_path = NULL;
+    char *output_path = NULL;
+    FILE *input = NULL;
+    FILE *output_reservation = NULL;
     IOStats stats;
     int result;
     bool passed;
-    unsigned long long stamp = (unsigned long long)time(NULL);
 
-    (void)snprintf(input_path, sizeof(input_path), ".extsort_test_%llu_%zu_input.txt",
-                   stamp, number);
-    (void)snprintf(output_path, sizeof(output_path), ".extsort_test_%llu_%zu_output.txt",
-                   stamp, number);
-
-    input = fopen(input_path, "w");
-    if (input == NULL) {
-        fprintf(stderr, "FAIL: %s (cannot create test input)\n", test->name);
+    input_path = create_temp_file_near("extsort_test_input", 0, number, &input);
+    if (input_path == NULL || input == NULL) {
+        fprintf(stderr, "FAIL: %s (cannot create unique test input)\n", test->name);
+        free(input_path);
         return false;
     }
     {
         bool write_ok = fputs(test->input_text, input) != EOF;
         if (fclose(input) != 0) write_ok = false;
+        input = NULL;
         if (!write_ok) {
-            (void)remove(input_path);
+            (void)remove_owned_file(input_path, "test input");
+            free(input_path);
             fprintf(stderr, "FAIL: %s (cannot write test input)\n", test->name);
             return false;
         }
     }
-    (void)remove(output_path);
+
+    output_path = create_temp_file_near("extsort_test_output", 0, number,
+                                        &output_reservation);
+    if (output_path == NULL || output_reservation == NULL) {
+        (void)remove_owned_file(input_path, "test input");
+        free(input_path);
+        free(output_path);
+        fprintf(stderr, "FAIL: %s (cannot reserve unique test output)\n", test->name);
+        return false;
+    }
+    if (fclose(output_reservation) != 0) {
+        output_reservation = NULL;
+        (void)remove_owned_file(input_path, "test input");
+        (void)remove_owned_file(output_path, "test output");
+        free(input_path); free(output_path);
+        fprintf(stderr, "FAIL: %s (cannot close test output reservation)\n", test->name);
+        return false;
+    }
+    output_reservation = NULL;
 
     result = external_sort(input_path, output_path, test->M, test->K, &stats);
-    if (test->should_succeed) {
+    if (test->should_succeed)
         passed = result == 0 && output_matches(output_path, test->expected, test->expected_count);
-    } else {
+    else
         passed = result != 0;
-    }
 
-    (void)remove(input_path);
-    (void)remove(output_path);
+    (void)remove_owned_file(input_path, "test input");
+    (void)remove_owned_file(output_path, "test output");
+    free(input_path); free(output_path);
 
     if (passed) printf("[PASS] %s\n", test->name);
     else printf("[FAIL] %s\n", test->name);
@@ -857,40 +1174,91 @@ static bool run_one_test(const TestCase *test, size_t number) {
 }
 
 static bool run_embedded_nul_test(void) {
-    char input_path[160];
-    char output_path[160];
-    FILE *input;
+    char *input_path = NULL;
+    char *output_path = NULL;
+    FILE *input = NULL;
+    FILE *output_reservation = NULL;
     IOStats stats;
     bool write_ok;
     bool passed;
     int result;
-    unsigned long long stamp = (unsigned long long)time(NULL);
 
-    (void)snprintf(input_path, sizeof(input_path), ".extsort_test_%llu_nul_input.txt", stamp);
-    (void)snprintf(output_path, sizeof(output_path), ".extsort_test_%llu_nul_output.txt", stamp);
-
-    input = fopen(input_path, "wb");
-    if (input == NULL) {
-        fprintf(stderr, "FAIL: embedded NUL byte is rejected (cannot create test input)\n");
+    input_path = create_temp_file_near("extsort_test_nul_input", 0, 0, &input);
+    if (input_path == NULL || input == NULL) {
+        fprintf(stderr, "FAIL: embedded NUL byte is rejected (cannot create input)\n");
+        free(input_path);
         return false;
     }
     write_ok = fputs("12", input) != EOF && fputc('\0', input) != EOF &&
                fputs("junk\n4\n", input) != EOF;
     if (fclose(input) != 0) write_ok = false;
+    input = NULL;
     if (!write_ok) {
-        (void)remove(input_path);
-        fprintf(stderr, "FAIL: embedded NUL byte is rejected (cannot write test input)\n");
+        (void)remove_owned_file(input_path, "test input");
+        free(input_path);
+        fprintf(stderr, "FAIL: embedded NUL byte is rejected (cannot write input)\n");
         return false;
     }
-
-    (void)remove(output_path);
+    output_path = create_temp_file_near("extsort_test_nul_output", 0, 0,
+                                        &output_reservation);
+    if (output_path == NULL || output_reservation == NULL) {
+        (void)remove_owned_file(input_path, "test input");
+        free(input_path); free(output_path);
+        fprintf(stderr, "FAIL: embedded NUL byte is rejected (cannot reserve output)\n");
+        return false;
+    }
+    if (fclose(output_reservation) != 0) {
+        (void)remove_owned_file(input_path, "test input");
+        (void)remove_owned_file(output_path, "test output");
+        free(input_path); free(output_path);
+        return false;
+    }
     result = external_sort(input_path, output_path, 1, 2, &stats);
     passed = result != 0;
-    (void)remove(input_path);
-    (void)remove(output_path);
+    (void)remove_owned_file(input_path, "test input");
+    (void)remove_owned_file(output_path, "test output");
+    free(input_path); free(output_path);
     if (passed) printf("[PASS] embedded NUL byte is rejected\n");
     else printf("[FAIL] embedded NUL byte is rejected\n");
     return passed;
+}
+
+static bool run_output_preservation_test(void) {
+    char *input_path = NULL;
+    char *output_path = NULL;
+    FILE *input = NULL;
+    FILE *output = NULL;
+    IOStats stats;
+    bool setup_ok = true;
+    bool preserved = false;
+    int result;
+
+    input_path = create_temp_file_near("extsort_preserve_input", 0, 0, &input);
+    if (input_path == NULL || input == NULL) setup_ok = false;
+    if (setup_ok) {
+        if (fputs("10\n20\ninvalid\n30\n", input) == EOF) setup_ok = false;
+        if (fclose(input) != 0) setup_ok = false;
+        input = NULL;
+    }
+    output_path = create_temp_file_near("extsort_preserve_output", 0, 0, &output);
+    if (output_path == NULL || output == NULL) setup_ok = false;
+    if (setup_ok) {
+        if (fputs("ORIGINAL_OUTPUT\n", output) == EOF) setup_ok = false;
+        if (fclose(output) != 0) setup_ok = false;
+        output = NULL;
+    }
+    if (input != NULL) (void)fclose(input);
+    if (output != NULL) (void)fclose(output);
+
+    result = setup_ok ? external_sort(input_path, output_path, 1, 2, &stats) : 0;
+    if (setup_ok && result != 0)
+        preserved = file_matches_text(output_path, "ORIGINAL_OUTPUT\n");
+    (void)remove_owned_file(input_path, "test input");
+    (void)remove_owned_file(output_path, "test output");
+    free(input_path); free(output_path);
+    if (preserved) printf("[PASS] failed input does not overwrite existing destination\n");
+    else printf("[FAIL] failed input does not overwrite existing destination\n");
+    return preserved;
 }
 
 static int run_tests(void) {
@@ -919,13 +1287,14 @@ static int run_tests(void) {
 
     size_t i;
     size_t passed = 0;
-    size_t total = sizeof(cases) / sizeof(cases[0]) + 1;
+    size_t total = sizeof(cases) / sizeof(cases[0]) + 2;
 
     printf("Running %zu built-in tests...\n", total);
     for (i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         if (run_one_test(&cases[i], i)) passed++;
     }
     if (run_embedded_nul_test()) passed++;
+    if (run_output_preservation_test()) passed++;
     printf("Test summary: %zu/%zu passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
