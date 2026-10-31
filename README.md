@@ -4,8 +4,6 @@ A C11 project that demonstrates **external merge sorting** for integer files tha
 
 The project also records the number of processing passes and the amount of logical data read and written. Different merge orders (`K`) can be tested to see how they affect the number of passes, I/O volume, and runtime.
 
-> **Final source note:** The Week 4 version that passed the final verification is named `stress_test_week4_fixed.c`. At the time this README was prepared, that file was available locally but had **not yet been uploaded to the GitHub repository**. Add this source file to the repository together with this README before using the build commands below from a fresh clone. The files already in the repository include earlier development versions; they should not be confused with the Week 4 final verified source.
-
 ## Project features
 
 - External sorting with a configurable in-memory buffer size (`M`).
