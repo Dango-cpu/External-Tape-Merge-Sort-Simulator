@@ -107,7 +107,7 @@ The benchmark uses `M = 1,000`, input sizes of 5,000, 20,000, 100,000, and 1,000
 
 ## Final verification results
 
-The following results are from the Week 4 final verification of `stress_test_week4_fixed.c`:
+The following results are from the Week 4 final verification of `stress_test_week4.c`:
 
 | Check | Result |
 |---|---:|
@@ -165,9 +165,8 @@ The I/O counters do not measure physical disk traffic. They do not include devic
 
 Known limitations and handoff notes:
 
-- Windows/MSVC compatibility was not tested, so it should not be considered verified.
+- Windows/MSVC compatibility is not guaranteed.
 - Concurrent execution of multiple copies of the program was not tested. More collision-resistant temporary-file naming could be considered if concurrent runs are required.
-- The Week 4 corrected source and final report were local deliverables when this README was prepared and had not yet been pushed to GitHub. Upload `stress_test_week4_fixed.c` before relying on the build commands in this README.
 - Benchmark comparisons should include the compiler, optimization flags, computer, CPU-time measurement method, and logical-byte I/O convention.
 
 ## Repository
