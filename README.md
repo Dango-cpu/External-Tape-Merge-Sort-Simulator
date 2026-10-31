@@ -32,7 +32,7 @@ The program uses bounded chunks for run generation, so it does not need to load 
 - A command-line terminal.
 - The standard C library.
 
-The final Week 4 source was verified with GCC and Clang using strict warning options. Windows/MSVC is **not verified** in the recorded tests.
+Caution: Window/MSVC may encounter small errors (unaffected to the final result), there may exist more errors concerning this compiler. We recommend you use GCC or Clang for a more stable experience.
 
 ## Build
 
